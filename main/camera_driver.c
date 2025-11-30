@@ -39,7 +39,7 @@ static camera_config_t camera_config = {
 
     /* Image configuration */
     .pixel_format   = PIXFORMAT_GRAYSCALE,
-    .frame_size     = FRAMESIZE_UXGA,
+    .frame_size     = FRAMESIZE_VGA,    // 640x480 for manageable memory usage
     .jpeg_quality   = 8,                // Only used for JPEG modes
     .fb_count       = 1,
     .fb_location    = CAMERA_FB_IN_PSRAM,
