@@ -11,6 +11,7 @@
  * - SD card inserted into the module
  */
 
+#include <stdio.h>
 /* Standard library includes */
 #include <string.h>
 #include <sys/unistd.h>
@@ -20,30 +21,22 @@
 #include <esp_log.h>
 #include <esp_system.h>
 #include <nvs_flash.h>
+#include <esp_err.h>
 
 /* FreeRTOS includes */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
-#include "freertos/queue.h"
 
 /* Application modules */
 #include "app_config.h"
 #include "camera_driver.h"
 #include "sd_card_driver.h"
 #include "file_operations.h"
-#include "driver/gpio.h"
 
-#define PIR_SENSOR_PIN 12 // GPIO 12
+#include <esp_dsp.h>
+#include "uuid4/uuid4.h"
 
-static const char *TAG = "camera_sd_example";
-uint8_t intr_flag = 0;
-
-// ISR handler for GPIO interrupt
-static void IRAM_ATTR gpio_isr_handler(void* arg) {
-    // ESP_LOGI(TAG, "Rising edge detected on GPIO 12!");
-    intr_flag = 1;
-}
+static const char *TAG = "dps_final_project";
 
 /**
  * @brief Capture and save a photo to SD card
@@ -64,9 +57,19 @@ static esp_err_t capture_and_save_photo(void)
         return ESP_FAIL;
     }
 
+    if (frame_buffer->format != PIXFORMAT_GRAYSCALE)
+    {
+        ESP_LOGE(TAG, "Unexpected pixel format: %d", frame_buffer->format);
+        camera_return_frame_buffer(frame_buffer);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     /* Save photo to SD card */
-    const char *photo_path = MOUNT_POINT "/picture.jpg";
-    esp_err_t ret = file_write_binary(photo_path, frame_buffer->buf, frame_buffer->len);
+    char uuid_buf[UUID4_LEN];
+    uuid4_generate(uuid_buf);
+    char photo_path[sizeof(MOUNT_POINT) + UUID4_LEN + sizeof("/.pgm")];
+    snprintf(photo_path, sizeof(photo_path), MOUNT_POINT "/%s.pgm", uuid_buf);
+    esp_err_t ret = file_write_pgm(photo_path, frame_buffer->buf, frame_buffer->len, frame_buffer->width, frame_buffer->height);
 
     /* Return the frame buffer */
     camera_return_frame_buffer(frame_buffer);
@@ -79,19 +82,8 @@ static esp_err_t capture_and_save_photo(void)
  */
 void app_main(void)
 {
-    // Install GPIO ISR service and add handler
-    gpio_install_isr_service(0); // already installed
-    gpio_isr_handler_add(PIR_SENSOR_PIN, gpio_isr_handler, NULL);
 
-    // Configure GPIO 12 as input with pull-down and interrupt on rising edge
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_POSEDGE,
-        .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask = (1ULL << PIR_SENSOR_PIN),
-        .pull_down_en = 1,
-        .pull_up_en = 0,
-    };
-    gpio_config(&io_conf);
+    uuid4_init();
 
     ESP_LOGI(TAG, "Starting Camera SD Card Example");
 
@@ -126,25 +118,11 @@ void app_main(void)
     }
 #endif
 
-    // Configure GPIO 12 as input with pull-down and interrupt on rising edge
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_POSEDGE,
-        .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask = (1ULL << PIR_SENSOR_PIN),
-        .pull_down_en = 1,
-        .pull_up_en = 0,
-    };
-    gpio_config(&io_conf);
-
-    // Install GPIO ISR service and add handler
-    // gpio_install_isr_service(0); // already installed
-    gpio_isr_handler_add(PIR_SENSOR_PIN, gpio_isr_handler, NULL);
-
     ESP_LOGI(TAG, "Initiating camera warm-up delay (3 seconds)...");
     vTaskDelay(3000 / portTICK_PERIOD_MS);
 
     /* Warm-up loop to discard first few frames */
-    for (int i = 0; i < 100; i++)
+    for (int i = 0; i < 10; i++)
     {
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb)
@@ -170,24 +148,4 @@ void app_main(void)
     /* Cleanup and exit */
     sd_card_cleanup();
     ESP_LOGI(TAG, "Application completed, entering idle state");
-
-    /* Keep the task alive but idle */
-    while (1)
-    {
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-        
-        if (intr_flag == 1) {
-            ESP_LOGI(TAG, "Motion detected! Capturing photo...");
-            // esp_err_t ret = capture_and_save_photo();
-            // if (ret == ESP_OK)
-            // {
-            //     ESP_LOGI(TAG, "Photo captured and saved successfully!");
-            // }
-            // else
-            // {
-            //     ESP_LOGE(TAG, "Failed to capture/save photo: %s", esp_err_to_name(ret));
-            // }
-            intr_flag = 0;
-        }
-    }
 }

@@ -33,6 +33,43 @@ esp_err_t file_write_binary(const char *path, const uint8_t *data, size_t size)
     return ESP_OK;
 }
 
+esp_err_t file_write_pgm(const char *path, const uint8_t *data, size_t size, size_t width, size_t height)
+{
+    if (path == NULL || data == NULL || size == 0 || width == 0 || height == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_LOGI(TAG, "Writing PGM file: %s (%zux%zu, %zu bytes)", path, width, height, size);
+
+    FILE *file = fopen(path, "wb");
+    if (file == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to open PGM file for writing: %s", path);
+        return ESP_FAIL;
+    }
+
+    int written = fprintf(file, "P5\n%zu %zu\n255\n", width, height);
+    if (written <= 0)
+    {
+        ESP_LOGE(TAG, "Failed to write PGM header to: %s", path);
+        fclose(file);
+        return ESP_FAIL;
+    }
+
+    size_t pixels_written = fwrite(data, 1, size, file);
+    fclose(file);
+
+    if (pixels_written != size)
+    {
+        ESP_LOGE(TAG, "Failed to write complete PGM data (wrote %zu of %zu bytes)", pixels_written, size);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "PGM file written successfully");
+    return ESP_OK;
+}
+
 esp_err_t file_read_text(const char *path)
 {
     ESP_LOGI(TAG, "Reading text file: %s", path);

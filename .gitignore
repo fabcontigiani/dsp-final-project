@@ -57,6 +57,8 @@ pytest_embedded_log/
 # IDF Component Manager output
 dependencies.lock
 managed_components/
+include/
+lib/
 
 # Binary files
 *.bin

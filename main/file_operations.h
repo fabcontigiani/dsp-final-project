@@ -23,6 +23,17 @@ extern "C" {
 esp_err_t file_write_binary(const char *path, const uint8_t *data, size_t size);
 
 /**
+ * @brief Write an 8-bit grayscale image as a binary PGM file
+ * @param path Destination file path
+ * @param data Pointer to grayscale pixel buffer
+ * @param size Number of bytes in the pixel buffer
+ * @param width Image width in pixels
+ * @param height Image height in pixels
+ * @return ESP_OK on success, ESP_FAIL otherwise
+ */
+esp_err_t file_write_pgm(const char *path, const uint8_t *data, size_t size, size_t width, size_t height);
+
+/**
  * @brief Read and display content from a text file
  * @param path File path to read from
  * @return ESP_OK on success, ESP_FAIL otherwise
