@@ -67,6 +67,12 @@ static const float CONV_KERNEL[KERNEL_SIZE * KERNEL_SIZE] = {
 */
 /* ============================= */
 
+/* ===== CONTRAST STRETCHING PARAMETERS ===== */
+/* Adjust these values to control the output intensity range */
+#define CONTRAST_BOTTOM 0      // Minimum pixel level in adjusted image (0-255)
+#define CONTRAST_TOP 255       // Maximum pixel level in adjusted image (0-255)
+/* ========================================== */
+
 /**
  * @brief Apply 2D convolution to grayscale image
  * @param input Input image buffer (grayscale)
@@ -158,6 +164,73 @@ static esp_err_t apply_conv2d(const uint8_t *input, float *output, size_t width,
     }
 
     return ret;
+}
+
+/**
+ * @brief Apply contrast stretching to grayscale image
+ * 
+ * Applies the formula: p_adjust(m,n) = Bottom + ((p(m,n) - L) / (H - L)) * (Top - Bottom)
+ * where:
+ *   - p(m,n) is the original pixel value
+ *   - p_adjust(m,n) is the adjusted pixel value
+ *   - H is the maximum pixel level in the original image
+ *   - L is the minimum pixel level in the original image
+ *   - Top is the maximum pixel level in the new image (CONTRAST_TOP)
+ *   - Bottom is the minimum pixel level in the new image (CONTRAST_BOTTOM)
+ * 
+ * @param input Input image buffer (grayscale)
+ * @param output Output image buffer (must be pre-allocated, same size as input)
+ * @param width Image width
+ * @param height Image height
+ * @param bottom Minimum output intensity level
+ * @param top Maximum output intensity level
+ * @return ESP_OK on success, error code otherwise
+ */
+static esp_err_t apply_contrast_stretch(const uint8_t *input, uint8_t *output, 
+                                         size_t width, size_t height,
+                                         uint8_t bottom, uint8_t top)
+{
+    if (input == NULL || output == NULL || width == 0 || height == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t total_pixels = width * height;
+    
+    // Find min (L) and max (H) pixel values in the original image
+    uint8_t L = 255, H = 0;
+    for (size_t i = 0; i < total_pixels; i++) {
+        if (input[i] < L) L = input[i];
+        if (input[i] > H) H = input[i];
+    }
+
+    ESP_LOGI(TAG, "Original image range: L=%u, H=%u", L, H);
+    ESP_LOGI(TAG, "Target range: Bottom=%u, Top=%u", bottom, top);
+
+    // Handle edge case where all pixels have the same value
+    if (H == L) {
+        ESP_LOGW(TAG, "Image has uniform intensity, setting all pixels to midpoint");
+        uint8_t mid_value = (bottom + top) / 2;
+        for (size_t i = 0; i < total_pixels; i++) {
+            output[i] = mid_value;
+        }
+        return ESP_OK;
+    }
+
+    // Apply contrast stretching formula to each pixel
+    float range_ratio = (float)(top - bottom) / (float)(H - L);
+    for (size_t i = 0; i < total_pixels; i++) {
+        // p_adjust = Bottom + ((p - L) / (H - L)) * (Top - Bottom)
+        float adjusted = bottom + (input[i] - L) * range_ratio;
+        
+        // Clamp to valid range (should not be necessary, but safety check)
+        if (adjusted < 0.0f) adjusted = 0.0f;
+        if (adjusted > 255.0f) adjusted = 255.0f;
+        
+        output[i] = (uint8_t)(adjusted + 0.5f); // Round to nearest integer
+    }
+
+    ESP_LOGI(TAG, "Contrast stretching complete");
+    return ESP_OK;
 }
 
 /**
@@ -256,6 +329,35 @@ static esp_err_t capture_and_save_photo(void)
     }
 
     free(conv_output);
+
+    /* Apply contrast stretching to original image */
+    ESP_LOGI(TAG, "Applying contrast stretching...");
+    uint8_t *stretched_output = (uint8_t *)malloc(frame_buffer->len);
+    if (stretched_output != NULL) {
+        esp_err_t stretch_ret = apply_contrast_stretch(frame_buffer->buf, stretched_output,
+                                                        frame_buffer->width, frame_buffer->height,
+                                                        CONTRAST_BOTTOM, CONTRAST_TOP);
+        
+        if (stretch_ret == ESP_OK) {
+            char stretched_path[sizeof(MOUNT_POINT) + UUID4_LEN + sizeof("/_stretched.pgm")];
+            snprintf(stretched_path, sizeof(stretched_path), MOUNT_POINT "/%s_stretched.pgm", uuid_buf);
+            stretch_ret = file_write_pgm(stretched_path, stretched_output, frame_buffer->len,
+                                         frame_buffer->width, frame_buffer->height);
+            
+            if (stretch_ret == ESP_OK) {
+                ESP_LOGI(TAG, "Contrast-stretched image saved: %s", stretched_path);
+            } else {
+                ESP_LOGE(TAG, "Failed to save contrast-stretched image");
+            }
+        } else {
+            ESP_LOGE(TAG, "Contrast stretching failed: %s", esp_err_to_name(stretch_ret));
+        }
+        
+        free(stretched_output);
+    } else {
+        ESP_LOGE(TAG, "Failed to allocate buffer for contrast stretching");
+    }
+
     camera_return_frame_buffer(frame_buffer);
 
     return ret;
