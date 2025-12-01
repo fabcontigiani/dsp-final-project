@@ -1,14 +1,33 @@
 /**
- * ESP-IDF Camera and SD Card Example - Main Application
+ * ESP32-CAM Digital Signal Processing Application
  *
- * This example demonstrates how to:
- * - Initialize and configure an ESP32-CAM module
- * - Mount an SD card using SDMMC interface
- * - Capture a single photo and save it to the SD card
+ * This application demonstrates advanced image processing on ESP32-CAM:
+ * - Captures grayscale images (VGA 640x480) from OV2640 camera sensor
+ * - Applies multiple DSP operations using ESP-DSP library:
+ *   * 2D convolution filtering (configurable NxN kernels: edge detection, blur, sharpen)
+ *   * Contrast stretching (linear intensity mapping with configurable range)
+ *   * Histogram equalization (automatic contrast enhancement via CDF redistribution)
+ * - Saves original and processed images as PGM files to SD card
+ * - Generates detailed processing logs with timing metrics for each operation
+ * - All outputs share a common UUID for easy correlation
  *
  * Hardware Requirements:
- * - ESP32-CAM module (AI-Thinker or compatible)
- * - SD card inserted into the module
+ * - ESP32-CAM module (AI-Thinker or compatible) with PSRAM
+ * - SD card (FAT32 formatted, long filename support enabled)
+ * - Adequate lighting for camera sensor
+ *
+ * Output Files (per capture session):
+ * - {UUID}_original.pgm  : Original grayscale image
+ * - {UUID}_filtered.pgm  : Convolution filtered result
+ * - {UUID}_stretched.pgm : Contrast-stretched image
+ * - {UUID}_equalized.pgm : Histogram-equalized image
+ * - {UUID}_log.txt       : Processing log with timestamps and performance metrics
+ *
+ * Configuration:
+ * - Convolution kernel: Modify KERNEL_SIZE and CONV_KERNEL array
+ * - Contrast range: Adjust CONTRAST_BOTTOM and CONTRAST_TOP defines
+ * - Equalization: Set EQUALIZATION_MAX_LEVEL (typically 255)
+ * - Camera resolution: Edit camera_driver.c FRAMESIZE setting
  */
 
 #include <stdio.h>
