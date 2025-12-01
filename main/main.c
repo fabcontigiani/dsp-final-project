@@ -22,6 +22,7 @@
 #include <esp_system.h>
 #include <nvs_flash.h>
 #include <esp_err.h>
+#include <esp_timer.h>
 
 /* FreeRTOS includes */
 #include "freertos/FreeRTOS.h"
@@ -264,15 +265,23 @@ static esp_err_t apply_histogram_equalization(const uint8_t *input, uint8_t *out
 
     size_t total_pixels = width * height;
     
+    uint32_t *histogram = (uint32_t *)calloc(256, sizeof(uint32_t));
+    uint32_t *cdf = (uint32_t *)malloc(256 * sizeof(uint32_t));
+    
+    if (histogram == NULL || cdf == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate histogram/CDF buffers");
+        free(histogram);
+        free(cdf);
+        return ESP_ERR_NO_MEM;
+    }
+    
     // Build histogram: count occurrences of each intensity level (0-255)
-    uint32_t histogram[256] = {0};
     for (size_t i = 0; i < total_pixels; i++) {
         histogram[input[i]]++;
     }
 
     // Calculate cumulative distribution function (CDF)
     // CDF[i] = number of pixels with intensity <= i
-    uint32_t cdf[256] = {0};
     cdf[0] = histogram[0];
     for (int i = 1; i < 256; i++) {
         cdf[i] = cdf[i - 1] + histogram[i];
@@ -302,6 +311,9 @@ static esp_err_t apply_histogram_equalization(const uint8_t *input, uint8_t *out
         output[i] = (uint8_t)(equalized + 0.5f); // Round to nearest
     }
 
+    free(histogram);
+    free(cdf);
+    
     ESP_LOGI(TAG, "Histogram equalization complete");
     return ESP_OK;
 }
@@ -365,6 +377,7 @@ static esp_err_t capture_and_save_photo(void)
 
     /* Apply convolution */
     ESP_LOGI(TAG, "Processing convolution...");
+    int64_t conv_start = esp_timer_get_time();
     int out_width = frame_width - KERNEL_SIZE + 1;
     int out_height = frame_height - KERNEL_SIZE + 1;
     size_t output_size = out_width * out_height;
@@ -401,12 +414,15 @@ static esp_err_t capture_and_save_photo(void)
             }
         }
         free(conv_output);
+        int64_t conv_end = esp_timer_get_time();
+        ESP_LOGI(TAG, "Convolution completed in %.2f ms", (conv_end - conv_start) / 1000.0);
     } else {
         ESP_LOGW(TAG, "Skipping convolution - insufficient memory");
     }
 
     /* Apply contrast stretching - reuse working_buffer for output */
     ESP_LOGI(TAG, "Processing contrast stretching...");
+    int64_t stretch_start = esp_timer_get_time();
     uint8_t *stretched_output = (uint8_t *)malloc(frame_size);
     if (stretched_output != NULL) {
         esp_err_t stretch_ret = apply_contrast_stretch(working_buffer, stretched_output,
@@ -426,12 +442,15 @@ static esp_err_t capture_and_save_photo(void)
             }
         }
         free(stretched_output);
+        int64_t stretch_end = esp_timer_get_time();
+        ESP_LOGI(TAG, "Contrast stretching completed in %.2f ms", (stretch_end - stretch_start) / 1000.0);
     } else {
         ESP_LOGW(TAG, "Skipping contrast stretching - insufficient memory");
     }
 
     /* Apply histogram equalization - reuse working_buffer for output */
     ESP_LOGI(TAG, "Processing histogram equalization...");
+    int64_t eq_start = esp_timer_get_time();
     uint8_t *equalized_output = (uint8_t *)malloc(frame_size);
     if (equalized_output != NULL) {
         esp_err_t eq_ret = apply_histogram_equalization(working_buffer, equalized_output,
@@ -451,6 +470,8 @@ static esp_err_t capture_and_save_photo(void)
             }
         }
         free(equalized_output);
+        int64_t eq_end = esp_timer_get_time();
+        ESP_LOGI(TAG, "Histogram equalization completed in %.2f ms", (eq_end - eq_start) / 1000.0);
     } else {
         ESP_LOGW(TAG, "Skipping histogram equalization - insufficient memory");
     }
