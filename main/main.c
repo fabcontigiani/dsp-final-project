@@ -69,9 +69,14 @@ static const float CONV_KERNEL[KERNEL_SIZE * KERNEL_SIZE] = {
 
 /* ===== CONTRAST STRETCHING PARAMETERS ===== */
 /* Adjust these values to control the output intensity range */
-#define CONTRAST_BOTTOM 0      // Minimum pixel level in adjusted image (0-255)
-#define CONTRAST_TOP 255       // Maximum pixel level in adjusted image (0-255)
+#define CONTRAST_BOTTOM 50      // Minimum pixel level in adjusted image (0-255)
+#define CONTRAST_TOP 200       // Maximum pixel level in adjusted image (0-255)
 /* ========================================== */
+
+/* ===== HISTOGRAM EQUALIZATION PARAMETERS ===== */
+/* Maximum scale level for equalized output (typically 255) */
+#define EQUALIZATION_MAX_LEVEL 255
+/* ============================================= */
 
 /**
  * @brief Apply 2D convolution to grayscale image
@@ -234,6 +239,74 @@ static esp_err_t apply_contrast_stretch(const uint8_t *input, uint8_t *output,
 }
 
 /**
+ * @brief Apply histogram equalization to grayscale image
+ * 
+ * Applies the formula: p_eq(m,n) = [CDF(p(m,n)) / total_pixels] * max_level
+ * where CDF(p) is the cumulative count of pixels with intensity <= p
+ * 
+ * This redistributes pixel intensities to use the full dynamic range,
+ * improving contrast in images with poor intensity distribution.
+ * 
+ * @param input Input image buffer (grayscale)
+ * @param output Output image buffer (must be pre-allocated, same size as input)
+ * @param width Image width
+ * @param height Image height
+ * @param max_level Maximum scale level for output (typically 255)
+ * @return ESP_OK on success, error code otherwise
+ */
+static esp_err_t apply_histogram_equalization(const uint8_t *input, uint8_t *output,
+                                                size_t width, size_t height,
+                                                uint8_t max_level)
+{
+    if (input == NULL || output == NULL || width == 0 || height == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t total_pixels = width * height;
+    
+    // Build histogram: count occurrences of each intensity level (0-255)
+    uint32_t histogram[256] = {0};
+    for (size_t i = 0; i < total_pixels; i++) {
+        histogram[input[i]]++;
+    }
+
+    // Calculate cumulative distribution function (CDF)
+    // CDF[i] = number of pixels with intensity <= i
+    uint32_t cdf[256] = {0};
+    cdf[0] = histogram[0];
+    for (int i = 1; i < 256; i++) {
+        cdf[i] = cdf[i - 1] + histogram[i];
+    }
+
+    // Log histogram statistics
+    int min_intensity = -1, max_intensity = -1;
+    for (int i = 0; i < 256; i++) {
+        if (histogram[i] > 0) {
+            if (min_intensity == -1) min_intensity = i;
+            max_intensity = i;
+        }
+    }
+    ESP_LOGI(TAG, "Histogram range: %d to %d", min_intensity, max_intensity);
+
+    // Apply equalization formula to each pixel
+    // p_eq = (CDF[p] / total_pixels) * max_level
+    float scale_factor = (float)max_level / (float)total_pixels;
+    for (size_t i = 0; i < total_pixels; i++) {
+        uint8_t original_value = input[i];
+        float equalized = cdf[original_value] * scale_factor;
+        
+        // Clamp to valid range
+        if (equalized < 0.0f) equalized = 0.0f;
+        if (equalized > (float)max_level) equalized = (float)max_level;
+        
+        output[i] = (uint8_t)(equalized + 0.5f); // Round to nearest
+    }
+
+    ESP_LOGI(TAG, "Histogram equalization complete");
+    return ESP_OK;
+}
+
+/**
  * @brief Capture and save a photo to SD card
  * @return ESP_OK on success, error code otherwise
  */
@@ -275,90 +348,114 @@ static esp_err_t capture_and_save_photo(void)
     }
     ESP_LOGI(TAG, "Original image saved: %s", original_path);
 
+    // Copy frame data to working buffer and free camera frame early
+    size_t frame_size = frame_buffer->len;
+    size_t frame_width = frame_buffer->width;
+    size_t frame_height = frame_buffer->height;
+    
+    uint8_t *working_buffer = (uint8_t *)malloc(frame_size);
+    if (working_buffer == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate working buffer");
+        camera_return_frame_buffer(frame_buffer);
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(working_buffer, frame_buffer->buf, frame_size);
+    camera_return_frame_buffer(frame_buffer); // Free camera buffer early
+    frame_buffer = NULL;
+
     /* Apply convolution */
-    int out_width = frame_buffer->width - KERNEL_SIZE + 1;
-    int out_height = frame_buffer->height - KERNEL_SIZE + 1;
+    ESP_LOGI(TAG, "Processing convolution...");
+    int out_width = frame_width - KERNEL_SIZE + 1;
+    int out_height = frame_height - KERNEL_SIZE + 1;
     size_t output_size = out_width * out_height;
 
-    ESP_LOGI(TAG, "Allocating %.1f KB for convolution output (%dx%d)", 
-             (output_size * sizeof(float)) / 1024.0f, out_width, out_height);
-
-    // Try regular malloc first (faster), then SPIRAM
     float *conv_output = (float *)malloc(output_size * sizeof(float));
     if (conv_output == NULL) {
         conv_output = (float *)heap_caps_malloc(output_size * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
-    if (conv_output == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate convolution output buffer (%.1f KB needed)", 
-                 (output_size * sizeof(float)) / 1024.0f);
-        camera_return_frame_buffer(frame_buffer);
-        return ESP_ERR_NO_MEM;
-    }
-    ESP_LOGI(TAG, "Convolution output buffer allocated successfully");
+    if (conv_output != NULL) {
+        ret = apply_conv2d(working_buffer, conv_output, frame_width, frame_height,
+                           CONV_KERNEL, KERNEL_SIZE);
+        
+        if (ret == ESP_OK) {
+            uint8_t *output_u8 = (uint8_t *)malloc(output_size);
+            if (output_u8 != NULL) {
+                for (size_t i = 0; i < output_size; i++) {
+                    float val = conv_output[i];
+                    if (val < 0.0f) val = 0.0f;
+                    if (val > 255.0f) val = 255.0f;
+                    output_u8[i] = (uint8_t)val;
+                }
 
-    ret = apply_conv2d(frame_buffer->buf, conv_output, frame_buffer->width, frame_buffer->height,
-                       CONV_KERNEL, KERNEL_SIZE);
-    
-    if (ret == ESP_OK) {
-        /* Convert float output back to uint8 and save */
-        uint8_t *output_u8 = (uint8_t *)malloc(output_size);
-        if (output_u8 != NULL) {
-            // Normalize and clamp to 0-255
-            for (size_t i = 0; i < output_size; i++) {
-                float val = conv_output[i];
-                if (val < 0.0f) val = 0.0f;
-                if (val > 255.0f) val = 255.0f;
-                output_u8[i] = (uint8_t)val;
+                char filtered_path[sizeof(MOUNT_POINT) + UUID4_LEN + sizeof("/_filtered.pgm")];
+                snprintf(filtered_path, sizeof(filtered_path), MOUNT_POINT "/%s_filtered.pgm", uuid_buf);
+                ret = file_write_pgm(filtered_path, output_u8, output_size, out_width, out_height);
+                
+                if (ret == ESP_OK) {
+                    ESP_LOGI(TAG, "Filtered image saved: %s", filtered_path);
+                } else {
+                    ESP_LOGE(TAG, "Failed to save filtered image");
+                }
+                
+                free(output_u8);
             }
-
-            char filtered_path[sizeof(MOUNT_POINT) + UUID4_LEN + sizeof("/_filtered.pgm")];
-            snprintf(filtered_path, sizeof(filtered_path), MOUNT_POINT "/%s_filtered.pgm", uuid_buf);
-            ret = file_write_pgm(filtered_path, output_u8, output_size, out_width, out_height);
-            
-            if (ret == ESP_OK) {
-                ESP_LOGI(TAG, "Filtered image saved: %s", filtered_path);
-            } else {
-                ESP_LOGE(TAG, "Failed to save filtered image");
-            }
-            
-            free(output_u8);
-        } else {
-            ESP_LOGE(TAG, "Failed to allocate uint8 output buffer");
-            ret = ESP_ERR_NO_MEM;
         }
+        free(conv_output);
+    } else {
+        ESP_LOGW(TAG, "Skipping convolution - insufficient memory");
     }
 
-    free(conv_output);
-
-    /* Apply contrast stretching to original image */
-    ESP_LOGI(TAG, "Applying contrast stretching...");
-    uint8_t *stretched_output = (uint8_t *)malloc(frame_buffer->len);
+    /* Apply contrast stretching - reuse working_buffer for output */
+    ESP_LOGI(TAG, "Processing contrast stretching...");
+    uint8_t *stretched_output = (uint8_t *)malloc(frame_size);
     if (stretched_output != NULL) {
-        esp_err_t stretch_ret = apply_contrast_stretch(frame_buffer->buf, stretched_output,
-                                                        frame_buffer->width, frame_buffer->height,
+        esp_err_t stretch_ret = apply_contrast_stretch(working_buffer, stretched_output,
+                                                        frame_width, frame_height,
                                                         CONTRAST_BOTTOM, CONTRAST_TOP);
         
         if (stretch_ret == ESP_OK) {
             char stretched_path[sizeof(MOUNT_POINT) + UUID4_LEN + sizeof("/_stretched.pgm")];
             snprintf(stretched_path, sizeof(stretched_path), MOUNT_POINT "/%s_stretched.pgm", uuid_buf);
-            stretch_ret = file_write_pgm(stretched_path, stretched_output, frame_buffer->len,
-                                         frame_buffer->width, frame_buffer->height);
+            stretch_ret = file_write_pgm(stretched_path, stretched_output, frame_size,
+                                         frame_width, frame_height);
             
             if (stretch_ret == ESP_OK) {
                 ESP_LOGI(TAG, "Contrast-stretched image saved: %s", stretched_path);
             } else {
                 ESP_LOGE(TAG, "Failed to save contrast-stretched image");
             }
-        } else {
-            ESP_LOGE(TAG, "Contrast stretching failed: %s", esp_err_to_name(stretch_ret));
         }
-        
         free(stretched_output);
     } else {
-        ESP_LOGE(TAG, "Failed to allocate buffer for contrast stretching");
+        ESP_LOGW(TAG, "Skipping contrast stretching - insufficient memory");
     }
 
-    camera_return_frame_buffer(frame_buffer);
+    /* Apply histogram equalization - reuse working_buffer for output */
+    ESP_LOGI(TAG, "Processing histogram equalization...");
+    uint8_t *equalized_output = (uint8_t *)malloc(frame_size);
+    if (equalized_output != NULL) {
+        esp_err_t eq_ret = apply_histogram_equalization(working_buffer, equalized_output,
+                                                         frame_width, frame_height,
+                                                         EQUALIZATION_MAX_LEVEL);
+        
+        if (eq_ret == ESP_OK) {
+            char equalized_path[sizeof(MOUNT_POINT) + UUID4_LEN + sizeof("/_equalized.pgm")];
+            snprintf(equalized_path, sizeof(equalized_path), MOUNT_POINT "/%s_equalized.pgm", uuid_buf);
+            eq_ret = file_write_pgm(equalized_path, equalized_output, frame_size,
+                                    frame_width, frame_height);
+            
+            if (eq_ret == ESP_OK) {
+                ESP_LOGI(TAG, "Equalized image saved: %s", equalized_path);
+            } else {
+                ESP_LOGE(TAG, "Failed to save equalized image");
+            }
+        }
+        free(equalized_output);
+    } else {
+        ESP_LOGW(TAG, "Skipping histogram equalization - insufficient memory");
+    }
+
+    free(working_buffer);
 
     return ret;
 }
