@@ -13,6 +13,7 @@
 
 #include <stdio.h>
 /* Standard library includes */
+#include <stdarg.h>
 #include <string.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
@@ -39,6 +40,46 @@
 #include <malloc.h>
 
 static const char *TAG = "dps_final_project";
+
+/* Global log file for capture session */
+static FILE *g_log_file = NULL;
+
+/**
+ * @brief Log to both console and file
+ */
+static void log_to_file(esp_log_level_t level, const char *format, ...)
+{
+    va_list args;
+    
+    // Log to console using standard ESP_LOG
+    va_start(args, format);
+    esp_log_writev(level, TAG, format, args);
+    va_end(args);
+    
+    // Also write to file if open
+    if (g_log_file != NULL) {
+        const char *level_str;
+        switch(level) {
+            case ESP_LOG_ERROR: level_str = "E"; break;
+            case ESP_LOG_WARN:  level_str = "W"; break;
+            case ESP_LOG_INFO:  level_str = "I"; break;
+            case ESP_LOG_DEBUG: level_str = "D"; break;
+            default:            level_str = "V"; break;
+        }
+        
+        fprintf(g_log_file, "(%lld) %s: ", esp_timer_get_time() / 1000, level_str);
+        va_start(args, format);
+        vfprintf(g_log_file, format, args);
+        va_end(args);
+        fprintf(g_log_file, "\n");
+        fflush(g_log_file); // Ensure data is written immediately
+    }
+}
+
+/* Convenience macros for file logging */
+#define LOG_FILE_I(fmt, ...) log_to_file(ESP_LOG_INFO, fmt, ##__VA_ARGS__)
+#define LOG_FILE_W(fmt, ...) log_to_file(ESP_LOG_WARN, fmt, ##__VA_ARGS__)
+#define LOG_FILE_E(fmt, ...) log_to_file(ESP_LOG_ERROR, fmt, ##__VA_ARGS__)
 
 /* ===== KERNEL DEFINITION ===== */
 /* Define your N×N convolution kernel here */
@@ -347,6 +388,19 @@ static esp_err_t capture_and_save_photo(void)
     /* Generate UUID for this capture session */
     char uuid_buf[UUID4_LEN];
     uuid4_generate(uuid_buf);
+    
+    /* Open log file for this capture session */
+    char log_path[sizeof(MOUNT_POINT) + UUID4_LEN + sizeof("/_log.txt")];
+    snprintf(log_path, sizeof(log_path), MOUNT_POINT "/%s_log.txt", uuid_buf);
+    g_log_file = fopen(log_path, "w");
+    if (g_log_file == NULL) {
+        ESP_LOGW(TAG, "Failed to open log file: %s", log_path);
+    } else {
+        fprintf(g_log_file, "=== Image Processing Log ===\n");
+        fprintf(g_log_file, "UUID: %s\n", uuid_buf);
+        fprintf(g_log_file, "Timestamp: %lld ms\n\n", esp_timer_get_time() / 1000);
+        fflush(g_log_file);
+    }
 
     /* Save original photo to SD card */
     char original_path[sizeof(MOUNT_POINT) + UUID4_LEN + sizeof("/_original.pgm")];
@@ -354,11 +408,12 @@ static esp_err_t capture_and_save_photo(void)
     esp_err_t ret = file_write_pgm(original_path, frame_buffer->buf, frame_buffer->len, 
                                     frame_buffer->width, frame_buffer->height);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to save original image");
+        LOG_FILE_E("Failed to save original image");
+        if (g_log_file) { fclose(g_log_file); g_log_file = NULL; }
         camera_return_frame_buffer(frame_buffer);
         return ret;
     }
-    ESP_LOGI(TAG, "Original image saved: %s", original_path);
+    LOG_FILE_I("Original image saved: %s (%zux%zu pixels)", original_path, frame_buffer->width, frame_buffer->height);
 
     // Copy frame data to working buffer and free camera frame early
     size_t frame_size = frame_buffer->len;
@@ -367,7 +422,8 @@ static esp_err_t capture_and_save_photo(void)
     
     uint8_t *working_buffer = (uint8_t *)malloc(frame_size);
     if (working_buffer == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate working buffer");
+        LOG_FILE_E("Failed to allocate working buffer");
+        if (g_log_file) { fclose(g_log_file); g_log_file = NULL; }
         camera_return_frame_buffer(frame_buffer);
         return ESP_ERR_NO_MEM;
     }
@@ -376,7 +432,7 @@ static esp_err_t capture_and_save_photo(void)
     frame_buffer = NULL;
 
     /* Apply convolution */
-    ESP_LOGI(TAG, "Processing convolution...");
+    LOG_FILE_I("Processing convolution...");
     int64_t conv_start = esp_timer_get_time();
     int out_width = frame_width - KERNEL_SIZE + 1;
     int out_height = frame_height - KERNEL_SIZE + 1;
@@ -405,9 +461,9 @@ static esp_err_t capture_and_save_photo(void)
                 ret = file_write_pgm(filtered_path, output_u8, output_size, out_width, out_height);
                 
                 if (ret == ESP_OK) {
-                    ESP_LOGI(TAG, "Filtered image saved: %s", filtered_path);
+                    LOG_FILE_I("Filtered image saved: %s", filtered_path);
                 } else {
-                    ESP_LOGE(TAG, "Failed to save filtered image");
+                    LOG_FILE_E("Failed to save filtered image");
                 }
                 
                 free(output_u8);
@@ -415,13 +471,13 @@ static esp_err_t capture_and_save_photo(void)
         }
         free(conv_output);
         int64_t conv_end = esp_timer_get_time();
-        ESP_LOGI(TAG, "Convolution completed in %.2f ms", (conv_end - conv_start) / 1000.0);
+        LOG_FILE_I("Convolution completed in %.2f ms", (conv_end - conv_start) / 1000.0);
     } else {
-        ESP_LOGW(TAG, "Skipping convolution - insufficient memory");
+        LOG_FILE_W("Skipping convolution - insufficient memory");
     }
 
     /* Apply contrast stretching - reuse working_buffer for output */
-    ESP_LOGI(TAG, "Processing contrast stretching...");
+    LOG_FILE_I("Processing contrast stretching...");
     int64_t stretch_start = esp_timer_get_time();
     uint8_t *stretched_output = (uint8_t *)malloc(frame_size);
     if (stretched_output != NULL) {
@@ -436,20 +492,20 @@ static esp_err_t capture_and_save_photo(void)
                                          frame_width, frame_height);
             
             if (stretch_ret == ESP_OK) {
-                ESP_LOGI(TAG, "Contrast-stretched image saved: %s", stretched_path);
+                LOG_FILE_I("Contrast-stretched image saved: %s", stretched_path);
             } else {
-                ESP_LOGE(TAG, "Failed to save contrast-stretched image");
+                LOG_FILE_E("Failed to save contrast-stretched image");
             }
         }
         free(stretched_output);
         int64_t stretch_end = esp_timer_get_time();
-        ESP_LOGI(TAG, "Contrast stretching completed in %.2f ms", (stretch_end - stretch_start) / 1000.0);
+        LOG_FILE_I("Contrast stretching completed in %.2f ms", (stretch_end - stretch_start) / 1000.0);
     } else {
-        ESP_LOGW(TAG, "Skipping contrast stretching - insufficient memory");
+        LOG_FILE_W("Skipping contrast stretching - insufficient memory");
     }
 
     /* Apply histogram equalization - reuse working_buffer for output */
-    ESP_LOGI(TAG, "Processing histogram equalization...");
+    LOG_FILE_I("Processing histogram equalization...");
     int64_t eq_start = esp_timer_get_time();
     uint8_t *equalized_output = (uint8_t *)malloc(frame_size);
     if (equalized_output != NULL) {
@@ -464,19 +520,27 @@ static esp_err_t capture_and_save_photo(void)
                                     frame_width, frame_height);
             
             if (eq_ret == ESP_OK) {
-                ESP_LOGI(TAG, "Equalized image saved: %s", equalized_path);
+                LOG_FILE_I("Equalized image saved: %s", equalized_path);
             } else {
-                ESP_LOGE(TAG, "Failed to save equalized image");
+                LOG_FILE_E("Failed to save equalized image");
             }
         }
         free(equalized_output);
         int64_t eq_end = esp_timer_get_time();
-        ESP_LOGI(TAG, "Histogram equalization completed in %.2f ms", (eq_end - eq_start) / 1000.0);
+        LOG_FILE_I("Histogram equalization completed in %.2f ms", (eq_end - eq_start) / 1000.0);
     } else {
-        ESP_LOGW(TAG, "Skipping histogram equalization - insufficient memory");
+        LOG_FILE_W("Skipping histogram equalization - insufficient memory");
     }
 
     free(working_buffer);
+    
+    /* Close log file */
+    if (g_log_file) {
+        fprintf(g_log_file, "\n=== Processing Complete ===\n");
+        fclose(g_log_file);
+        g_log_file = NULL;
+        ESP_LOGI(TAG, "Processing log saved: %s", log_path);
+    }
 
     return ret;
 }
